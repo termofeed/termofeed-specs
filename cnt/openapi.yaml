@@ -1,0 +1,565 @@
+openapi: 3.1.0
+info:
+  title: Termômetro de Humor API
+  version: 1.0.0
+  description: |
+    API de salas virtuais onde os participantes reagem com emojis.
+    Não existe login. Dois tokens substituem o login:
+
+    - `hostToken`: a API devolve este token ao criar a sala. Só o criador tem o token.
+      O token permite encerrar e estender a sala.
+    - `participantToken`: a API devolve este token ao entrar na sala.
+      O token permite enviar reações.
+
+    O criador também é um participante. Ele chama `join` para reagir.
+
+    Os eventos em tempo real usam WebSocket. Veja o arquivo `asyncapi.yaml`.
+
+    ## Regras gerais
+    - Todo horário usa o formato ISO 8601 em UTC.
+    - O código da sala tem o formato `abc-defg-hij`.
+    - A API aplica o intervalo mínimo entre reações de cada participante.
+servers:
+  - url: https://api.exemplo.com/api/v1
+    description: Produção
+  - url: http://localhost:8080/api/v1
+    description: Local
+
+tags:
+  - name: Criador
+    description: Operações que exigem o `hostToken`.
+  - name: Participante
+    description: Operações que exigem o `participantToken`.
+  - name: Público
+    description: Operações sem token. Quem tem o link pode usar.
+
+paths:
+  /rooms:
+    post:
+      tags: [Criador]
+      operationId: createRoom
+      summary: Cria uma sala
+      description: Cria a sala e devolve o `hostToken`. Guarde o token. A API não mostra o token de novo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+            example:
+              name: Retro da Sprint 42
+              durationMinutes: 60
+              reactionCooldownSeconds: 5
+      responses:
+        '201':
+          description: Sala criada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateRoomResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /rooms/{code}:
+    get:
+      tags: [Público]
+      operationId: getRoom
+      summary: Consulta os dados públicos da sala
+      description: |
+        Use esta operação para validar o link antes de entrar.
+        Uma sala encerrada continua visível por 24 horas com `status = ended`.
+        Depois disso, a API responde `410`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      responses:
+        '200':
+          description: Dados da sala.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+
+  /rooms/{code}/join:
+    post:
+      tags: [Participante]
+      operationId: joinRoom
+      summary: Entra na sala
+      description: Registra o participante e devolve o `participantToken`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinRequest'
+      responses:
+        '201':
+          description: Participante registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A sala está encerrada ou cheia.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                encerrada:
+                  value: { code: ROOM_ENDED, message: A sala está encerrada. }
+                cheia:
+                  value: { code: ROOM_FULL, message: A sala atingiu o limite de participantes. }
+        '410':
+          $ref: '#/components/responses/Gone'
+
+  /rooms/{code}/reactions:
+    post:
+      tags: [Participante]
+      operationId: sendReaction
+      summary: Envia uma reação
+      description: |
+        O participante pode enviar uma reação a cada `reactionCooldownSeconds`.
+        Se ele enviar antes, a API responde `429` e informa quando tentar de novo.
+      security:
+        - participantToken: []
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReactionRequest'
+            example:
+              emoji: "😂"
+      responses:
+        '202':
+          description: Reação aceita.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReactionAccepted'
+        '400':
+          description: O emoji não está na lista permitida da sala.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example: { code: EMOJI_NOT_ALLOWED, message: Este emoji não é permitido nesta sala. }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A sala está encerrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example: { code: ROOM_ENDED, message: A sala está encerrada. }
+        '429':
+          description: O intervalo entre reações ainda não passou.
+          headers:
+            Retry-After:
+              description: Segundos até a próxima reação permitida.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example: { code: COOLDOWN_ACTIVE, message: Aguarde para reagir de novo., retryAfterSeconds: 3 }
+
+  /rooms/{code}/summary:
+    get:
+      tags: [Público]
+      operationId: getSummary
+      summary: Consulta o resumo dos emojis mais usados
+      description: |
+        Devolve a contagem, o ranking e o emoji dominante na janela de tempo escolhida.
+        O cliente usa estes dados para a animação. Para atualizações contínuas, use o WebSocket.
+        Em uma sala encerrada, use `window = all` para ver o resumo final.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - name: window
+          in: query
+          required: false
+          description: Janela de tempo do resumo.
+          schema:
+            type: string
+            enum: ['30s', '1m', '5m', 'all']
+            default: '1m'
+      responses:
+        '200':
+          description: Resumo da janela.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Summary'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+
+  /rooms/{code}/extend:
+    post:
+      tags: [Criador]
+      operationId: extendRoom
+      summary: Aumenta o tempo da sala
+      description: |
+        Soma minutos ao fim da sala. A duração total não pode passar de 480 minutos (8 horas).
+      security:
+        - hostToken: []
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtendRequest'
+            example:
+              extraMinutes: 15
+      responses:
+        '200':
+          description: Tempo aumentado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Room'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A sala está encerrada, ou a extensão passa do limite total.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                encerrada:
+                  value: { code: ROOM_ENDED, message: A sala está encerrada. }
+                limite:
+                  value: { code: DURATION_LIMIT_EXCEEDED, message: A duração total passa de 480 minutos. }
+
+  /rooms/{code}/close:
+    post:
+      tags: [Criador]
+      operationId: closeRoom
+      summary: Encerra a sala
+      description: Encerra a sala agora e devolve o resumo final. A operação é idempotente.
+      security:
+        - hostToken: []
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+      responses:
+        '200':
+          description: Sala encerrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClosedRoom'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rooms/{code}/ws:
+    get:
+      tags: [Participante]
+      operationId: connectWebSocket
+      summary: Abre a conexão WebSocket
+      description: |
+        Faz o upgrade para WebSocket e entrega os eventos da sala em tempo real.
+        Envie o `participantToken` no parâmetro de consulta `token`.
+        Os eventos estão descritos em `asyncapi.yaml`.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - name: token
+          in: query
+          required: true
+          description: O `participantToken` recebido em `join`.
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Conexão aceita. Troca de protocolo para WebSocket.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    hostToken:
+      type: apiKey
+      in: header
+      name: X-Host-Token
+      description: Token do criador da sala.
+    participantToken:
+      type: apiKey
+      in: header
+      name: X-Participant-Token
+      description: Token do participante.
+
+  parameters:
+    RoomCode:
+      name: code
+      in: path
+      required: true
+      description: Código da sala, que aparece no link.
+      schema:
+        type: string
+        pattern: '^[a-z]{3}-[a-z]{4}-[a-z]{3}$'
+        examples: [abc-defg-hij]
+
+  schemas:
+    CreateRoomRequest:
+      type: object
+      required: [durationMinutes]
+      properties:
+        name:
+          type: string
+          maxLength: 80
+          description: Nome da sala. Opcional.
+        durationMinutes:
+          type: integer
+          minimum: 5
+          maximum: 240
+          description: Duração inicial da sala, em minutos.
+        reactionCooldownSeconds:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 5
+          description: Intervalo mínimo entre duas reações do mesmo participante.
+        allowedEmojis:
+          type: array
+          minItems: 2
+          maxItems: 12
+          items:
+            type: string
+          description: Lista de emojis permitidos. Se omitida, a API usa a paleta padrão.
+          default: ["😀", "😂", "😍", "👏", "😮", "😢", "😡", "🤔"]
+        maxParticipants:
+          type: integer
+          minimum: 2
+          maximum: 200
+          default: 200
+
+    CreateRoomResponse:
+      type: object
+      required: [room, hostToken, joinUrl]
+      properties:
+        room:
+          $ref: '#/components/schemas/Room'
+        hostToken:
+          type: string
+          description: Token secreto do criador. A API mostra o token só uma vez.
+        joinUrl:
+          type: string
+          format: uri
+          description: Link para compartilhar com os participantes.
+          examples: ['https://termometro.exemplo.com/r/abc-defg-hij']
+
+    Room:
+      type: object
+      required: [code, status, createdAt, expiresAt, reactionCooldownSeconds, allowedEmojis, participantCount]
+      properties:
+        code:
+          type: string
+          examples: [abc-defg-hij]
+        name:
+          type: string
+        status:
+          type: string
+          enum: [active, ended]
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          description: Horário em que a sala termina.
+        totalDurationMinutes:
+          type: integer
+          description: Duração total, com as extensões.
+        reactionCooldownSeconds:
+          type: integer
+        allowedEmojis:
+          type: array
+          items:
+            type: string
+        participantCount:
+          type: integer
+        maxParticipants:
+          type: integer
+        endedAt:
+          type: [string, 'null']
+          format: date-time
+        endedReason:
+          type: [string, 'null']
+          enum: [host, timeout, null]
+
+    JoinRequest:
+      type: object
+      properties:
+        nickname:
+          type: string
+          maxLength: 30
+          description: Apelido opcional. Os outros participantes não veem este apelido nas reações.
+
+    JoinResponse:
+      type: object
+      required: [participantId, participantToken, room]
+      properties:
+        participantId:
+          type: string
+          format: uuid
+        participantToken:
+          type: string
+          description: Token secreto do participante.
+        room:
+          $ref: '#/components/schemas/Room'
+
+    ReactionRequest:
+      type: object
+      required: [emoji]
+      properties:
+        emoji:
+          type: string
+          description: Um emoji da lista `allowedEmojis` da sala.
+
+    ReactionAccepted:
+      type: object
+      required: [nextAllowedAt]
+      properties:
+        nextAllowedAt:
+          type: string
+          format: date-time
+          description: Horário em que o participante pode reagir de novo.
+
+    ExtendRequest:
+      type: object
+      required: [extraMinutes]
+      properties:
+        extraMinutes:
+          type: integer
+          minimum: 5
+          maximum: 60
+
+    EmojiCount:
+      type: object
+      required: [emoji, count, percentage]
+      properties:
+        emoji:
+          type: string
+        count:
+          type: integer
+        percentage:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+
+    Summary:
+      type: object
+      required: [window, from, to, totalReactions, ranking]
+      properties:
+        window:
+          type: string
+          enum: ['30s', '1m', '5m', 'all']
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        totalReactions:
+          type: integer
+        dominantEmoji:
+          type: [string, 'null']
+          description: Emoji mais usado na janela. É `null` se não houve reações.
+        ranking:
+          type: array
+          description: Emojis em ordem decrescente de uso.
+          items:
+            $ref: '#/components/schemas/EmojiCount'
+      example:
+        window: 1m
+        from: '2026-11-18T21:00:00Z'
+        to: '2026-11-18T21:01:00Z'
+        totalReactions: 24
+        dominantEmoji: "😂"
+        ranking:
+          - { emoji: "😂", count: 12, percentage: 50 }
+          - { emoji: "👏", count: 8, percentage: 33.3 }
+          - { emoji: "😮", count: 4, percentage: 16.7 }
+
+    ClosedRoom:
+      type: object
+      required: [room, summary]
+      properties:
+        room:
+          $ref: '#/components/schemas/Room'
+        summary:
+          $ref: '#/components/schemas/Summary'
+
+    Problem:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Código estável do erro, para uso no cliente.
+        message:
+          type: string
+          description: Texto para leitura humana.
+        retryAfterSeconds:
+          type: integer
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              issue:
+                type: string
+
+  responses:
+    ValidationError:
+      description: Os dados enviados não são válidos.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            code: VALIDATION_ERROR
+            message: Dados inválidos.
+            details:
+              - { field: durationMinutes, issue: Deve estar entre 5 e 240. }
+    Unauthorized:
+      description: O token não existe, é inválido ou não pertence a esta sala.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example: { code: UNAUTHORIZED, message: Token inválido. }
+    NotFound:
+      description: A sala não existe.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example: { code: ROOM_NOT_FOUND, message: Sala não encontrada. }
+    Gone:
+      description: A sala terminou há mais de 24 horas. A API já removeu os dados.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example: { code: ROOM_GONE, message: A sala não está mais disponível. }

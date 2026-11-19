@@ -1,0 +1,199 @@
+asyncapi: 3.0.0
+info:
+  title: Termômetro de Humor - Eventos em tempo real
+  version: 1.0.0
+  description: |
+    Eventos que o servidor envia por WebSocket.
+    O cliente só recebe eventos. O cliente envia reações por REST (`POST /rooms/{code}/reactions`).
+
+    O servidor envia `summary.updated` no máximo uma vez a cada 2 segundos.
+    O servidor fecha a conexão depois de `room.closed`.
+
+servers:
+  producao:
+    host: api.exemplo.com
+    protocol: wss
+    pathname: /api/v1
+  local:
+    host: localhost:8080
+    protocol: ws
+    pathname: /api/v1
+
+channels:
+  room:
+    address: /rooms/{code}/ws
+    description: Canal de eventos de uma sala.
+    parameters:
+      code:
+        description: Código da sala.
+        examples: [abc-defg-hij]
+    bindings:
+      ws:
+        query:
+          type: object
+          required: [token]
+          properties:
+            token:
+              type: string
+              description: O `participantToken` recebido em `join`.
+    messages:
+      reactionCreated:
+        $ref: '#/components/messages/reactionCreated'
+      summaryUpdated:
+        $ref: '#/components/messages/summaryUpdated'
+      participantsChanged:
+        $ref: '#/components/messages/participantsChanged'
+      roomExpiring:
+        $ref: '#/components/messages/roomExpiring'
+      roomExtended:
+        $ref: '#/components/messages/roomExtended'
+      roomClosed:
+        $ref: '#/components/messages/roomClosed'
+
+operations:
+  receiveRoomEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/room'
+    summary: O cliente recebe os eventos da sala.
+    messages:
+      - $ref: '#/channels/room/messages/reactionCreated'
+      - $ref: '#/channels/room/messages/summaryUpdated'
+      - $ref: '#/channels/room/messages/participantsChanged'
+      - $ref: '#/channels/room/messages/roomExpiring'
+      - $ref: '#/channels/room/messages/roomExtended'
+      - $ref: '#/channels/room/messages/roomClosed'
+
+components:
+  messages:
+    reactionCreated:
+      name: reaction.created
+      title: Nova reação
+      summary: Um participante enviou um emoji. A mensagem não traz a identidade de quem enviou. Use para efeitos visuais.
+      payload:
+        type: object
+        required: [type, emoji, at]
+        properties:
+          type:
+            const: reaction.created
+          emoji:
+            type: string
+          at:
+            type: string
+            format: date-time
+        examples:
+          - { type: reaction.created, emoji: "👏", at: '2026-11-18T21:00:03Z' }
+
+    summaryUpdated:
+      name: summary.updated
+      title: Resumo atualizado
+      summary: Contagem de emojis para as janelas de 30 s, 1 min e 5 min.
+      payload:
+        type: object
+        required: [type, windows]
+        properties:
+          type:
+            const: summary.updated
+          windows:
+            type: object
+            description: Cada chave é uma janela. O valor tem o mesmo formato de `Summary` na API REST.
+            required: ['30s', '1m', '5m']
+            additionalProperties:
+              $ref: '#/components/schemas/Summary'
+
+    participantsChanged:
+      name: participants.changed
+      title: Participantes mudaram
+      summary: Alguém entrou ou saiu da sala.
+      payload:
+        type: object
+        required: [type, participantCount]
+        properties:
+          type:
+            const: participants.changed
+          participantCount:
+            type: integer
+
+    roomExpiring:
+      name: room.expiring
+      title: Sala perto do fim
+      summary: A sala termina em 60 segundos.
+      payload:
+        type: object
+        required: [type, expiresAt, secondsLeft]
+        properties:
+          type:
+            const: room.expiring
+          expiresAt:
+            type: string
+            format: date-time
+          secondsLeft:
+            type: integer
+
+    roomExtended:
+      name: room.extended
+      title: Sala estendida
+      summary: O criador aumentou o tempo da sala.
+      payload:
+        type: object
+        required: [type, expiresAt, extraMinutes]
+        properties:
+          type:
+            const: room.extended
+          expiresAt:
+            type: string
+            format: date-time
+          extraMinutes:
+            type: integer
+
+    roomClosed:
+      name: room.closed
+      title: Sala encerrada
+      summary: A sala terminou. O servidor fecha a conexão depois deste evento.
+      payload:
+        type: object
+        required: [type, reason, endedAt, summary]
+        properties:
+          type:
+            const: room.closed
+          reason:
+            type: string
+            enum: [host, timeout]
+          endedAt:
+            type: string
+            format: date-time
+          summary:
+            $ref: '#/components/schemas/Summary'
+
+  schemas:
+    EmojiCount:
+      type: object
+      required: [emoji, count, percentage]
+      properties:
+        emoji:
+          type: string
+        count:
+          type: integer
+        percentage:
+          type: number
+    Summary:
+      type: object
+      required: [window, from, to, totalReactions, ranking]
+      properties:
+        window:
+          type: string
+          enum: ['30s', '1m', '5m', 'all']
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        totalReactions:
+          type: integer
+        dominantEmoji:
+          type: [string, 'null']
+        ranking:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmojiCount'
